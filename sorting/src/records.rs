@@ -1,6 +1,7 @@
 use inquire::Select;
 use memmap2::Mmap;
 use rayon::prelude::*;
+use smallstr::SmallString;
 use std::cmp::Ordering;
 use std::error::Error;
 use std::fs::{File, OpenOptions};
@@ -10,9 +11,14 @@ use std::time::Instant;
 use crate::mergesort::merge_sort;
 use crate::quicksort::quick_sort;
 
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::*;
+
+type SmallStr = SmallString<[u8; 32]>;
+
 #[derive(Debug, Clone, PartialEq, PartialOrd)]
 struct Record {
-    name: String,
+    name: SmallStr,
     value1: i64,
     value2: f64,
     line_range: (usize, usize),
@@ -31,7 +37,7 @@ pub fn run_sorting_with_records(algorithm_choice: &str) -> Result<(), Box<dyn Er
         let start_reading = Instant::now();
         let file = File::open("rsrc/records.csv")?;
         let mmap = unsafe { Mmap::map(&file)? };
-        let records = parse_csv_mmap(&mmap)?;
+        let records = parse_csv(&mmap)?;
         println!("Reading and parsing time: {:.4?}", start_reading.elapsed());
         (mmap, records)
     };
@@ -57,22 +63,74 @@ pub fn run_sorting_with_records(algorithm_choice: &str) -> Result<(), Box<dyn Er
     Ok(())
 }
 
-fn parse_csv_mmap(mmap: &Mmap) -> Result<Vec<Record>, Box<dyn Error>> {
-    let bytes = mmap.as_ref();
-    let num_chunks = rayon::current_num_threads() * 4;
-    let chunk_size = bytes.len() / num_chunks;
+#[cfg(target_arch = "x86_64")]
+unsafe fn find_commas_simd(bytes: &[u8]) -> (Option<usize>, Option<usize>, Option<usize>) {
+    let mut comma1 = None;
+    let mut comma2 = None;
+    let mut comma3 = None;
+    let comma = _mm_set1_epi8(b',' as i8);
+    let mut i = 0;
 
-    let chunk_boundaries: Vec<usize> = (0..num_chunks)
+    while i + 16 <= bytes.len() {
+        let chunk = _mm_loadu_si128(bytes.as_ptr().add(i) as *const __m128i);
+        let eq = _mm_cmpeq_epi8(chunk, comma);
+        let mask = _mm_movemask_epi8(eq) as u32;
+
+        if mask != 0 {
+            for j in 0..16 {
+                if mask & (1 << j) != 0 {
+                    let pos = i + j;
+                    if comma1.is_none() {
+                        comma1 = Some(pos);
+                    } else if comma2.is_none() {
+                        comma2 = Some(pos);
+                    } else if comma3.is_none() {
+                        comma3 = Some(pos);
+                        return (comma1, comma2, comma3);
+                    }
+                }
+            }
+        }
+        i += 16;
+    }
+
+    for (j, &b) in bytes[i..].iter().enumerate() {
+        if b == b',' {
+            let pos = i + j;
+            if comma1.is_none() {
+                comma1 = Some(pos);
+            } else if comma2.is_none() {
+                comma2 = Some(pos);
+            } else if comma3.is_none() {
+                comma3 = Some(pos);
+                break;
+            }
+        }
+    }
+
+    (comma1, comma2, comma3)
+}
+
+fn parse_csv(mmap: &Mmap) -> Result<Vec<Record>, Box<dyn Error>> {
+    let bytes = mmap.as_ref();
+    let num_chunks = rayon::current_num_threads();
+    let chunk_size = (bytes.len() + num_chunks - 1) / num_chunks;
+
+    let chunk_boundaries: Vec<usize> = (0..=num_chunks)
         .map(|i| {
             let pos = i * chunk_size;
-            if pos == 0 {
-                0
+            if pos == 0 || pos >= bytes.len() {
+                pos.min(bytes.len())
             } else {
-                bytes[pos..]
-                    .iter()
-                    .position(|&b| b == b'\n')
-                    .map(|p| pos + p + 1)
-                    .unwrap_or(bytes.len())
+                let mut p = pos;
+                while p < bytes.len() && bytes[p] != b'\n' {
+                    p += 1;
+                }
+                if p < bytes.len() {
+                    p + 1
+                } else {
+                    p
+                }
             }
         })
         .collect();
@@ -81,42 +139,52 @@ fn parse_csv_mmap(mmap: &Mmap) -> Result<Vec<Record>, Box<dyn Error>> {
         .par_windows(2)
         .flat_map(|window| {
             let chunk_start = window[0];
-            let chunk = &bytes[window[0]..window[1]];
-            let mut records = Vec::new();
-            let mut pos = 0;
+            let chunk_end = window[1];
+            let mut records = Vec::with_capacity(1024);
+            let mut pos = chunk_start;
 
-            while pos < chunk.len() {
+            while pos < chunk_end {
                 let line_start = pos;
-                while pos < chunk.len() && chunk[pos] != b'\n' {
+                while pos < chunk_end && bytes[pos] != b'\n' {
                     pos += 1;
                 }
 
                 if pos > line_start {
-                    let absolute_start = chunk_start + line_start;
-                    let absolute_end = chunk_start + pos - 1;
+                    let line_end = pos;
+                    pos += 1;
 
-                    let line = &chunk[line_start..pos];
-                    let mut fields = line.split(|&b| b == b',');
+                    let (comma1, comma2, comma3) =
+                        unsafe { find_commas_simd(&bytes[line_start..line_end]) };
 
-                    fields.next();
+                    if let (Some(c1), Some(c2), Some(c3)) = (comma1, comma2, comma3) {
+                        let name_bytes = &bytes[line_start + c1 + 1..line_start + c2];
+                        let name = match std::str::from_utf8(name_bytes) {
+                            Ok(s) => SmallStr::from(s),
+                            Err(_) => SmallStr::from(String::from_utf8_lossy(name_bytes).as_ref()),
+                        };
 
-                    if let (Some(name), Some(value1_bytes), Some(value2_bytes)) =
-                        (fields.next(), fields.next(), fields.next())
-                    {
-                        let name = String::from_utf8_lossy(name).into_owned();
-                        let value1 = parse_i64(value1_bytes).unwrap_or(0);
-                        let value2 = parse_f64(value2_bytes).unwrap_or(f64::NAN);
+                        let value1 = unsafe {
+                            std::str::from_utf8_unchecked(
+                                &bytes[line_start + c2 + 1..line_start + c3],
+                            )
+                            .parse()
+                            .unwrap_or(0)
+                        };
+
+                        let value2 = unsafe {
+                            std::str::from_utf8_unchecked(&bytes[line_start + c3 + 1..line_end])
+                                .parse()
+                                .unwrap_or(f64::NAN)
+                        };
 
                         records.push(Record {
                             name,
                             value1,
                             value2,
-                            line_range: (absolute_start, absolute_end),
+                            line_range: (line_start, line_end),
                         });
                     }
                 }
-
-                pos += 1;
             }
 
             records
@@ -125,16 +193,10 @@ fn parse_csv_mmap(mmap: &Mmap) -> Result<Vec<Record>, Box<dyn Error>> {
 
     Ok(records)
 }
-fn parse_i64(bytes: &[u8]) -> Option<i64> {
-    std::str::from_utf8(bytes).ok()?.parse().ok()
-}
-fn parse_f64(bytes: &[u8]) -> Option<f64> {
-    fast_float::parse(bytes).ok()
-}
 
 fn sort_records<F>(records: &mut [Record], algorithm: &str, cmp: F)
 where
-    F: Fn(&Record, &Record) -> Ordering,
+    F: Fn(&Record, &Record) -> Ordering + Sync,
 {
     match algorithm {
         "Merge Sort" => merge_sort(records, &cmp),
@@ -151,6 +213,7 @@ fn write_sorted_csv(
     let file = OpenOptions::new()
         .write(true)
         .truncate(true)
+        .create(true)
         .open(output_path)?;
     let mut writer = std::io::BufWriter::with_capacity(1024 * 1024 * 32, file);
 
