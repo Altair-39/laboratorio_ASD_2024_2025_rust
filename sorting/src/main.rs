@@ -37,7 +37,7 @@ pub fn main() {
             }
         }
         "Records" => {
-            run_sorting_with_records(algorithm_choice.to_string());
+            let _ = run_sorting_with_records(algorithm_choice);
         }
         _ => println!("Invalid data source selected."),
     }

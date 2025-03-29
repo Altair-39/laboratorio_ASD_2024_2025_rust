@@ -5,4 +5,7 @@ edition = "2021"
 
 [dependencies]
 csv = "1.3.1"
+fast-float = "0.2.0"
 inquire = "0.7.5"
+memmap2 = "0.9.5"
+rayon = "1.10.0"
