@@ -8,6 +8,7 @@ use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::time::Instant;
 
+use crate::compar::{compare_f64_quicksort, compare_str_lex};
 use crate::mergesort::merge_sort;
 use crate::quicksort::quick_sort;
 
@@ -44,12 +45,14 @@ pub fn run_sorting_with_records(algorithm_choice: &str) -> Result<(), Box<dyn Er
 
     let sort_start = Instant::now();
     match sort_column_choice {
-        "Name" => sort_records(&mut records, algorithm_choice, |a, b| a.name.cmp(&b.name)),
+        "Name" => sort_records(&mut records, algorithm_choice, |a, b| {
+            compare_str_lex(&a.name, &b.name)
+        }),
         "Value1" => sort_records(&mut records, algorithm_choice, |a, b| {
             a.value1.partial_cmp(&b.value1).unwrap_or(Ordering::Equal)
         }),
         "Value2" => sort_records(&mut records, algorithm_choice, |a, b| {
-            a.value2.partial_cmp(&b.value2).unwrap_or(Ordering::Equal)
+            compare_f64_quicksort(a.value2, b.value2)
         }),
         _ => eprintln!("Invalid column selected."),
     }
