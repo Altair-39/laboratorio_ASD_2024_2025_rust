@@ -1,11 +1,13 @@
 use edit::edit_distance;
 use edit::edit_distance_dyn;
 use inquire::{Select, Text};
+use memmap2::MmapOptions;
 use rayon::prelude::*;
 use regex::Regex;
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io;
+use std::str;
 use std::time::Instant;
 
 mod edit;
@@ -46,6 +48,14 @@ fn manual_mode() {
     );
 }
 
+fn build_len_index(dictionary: &[String]) -> HashMap<usize, Vec<&String>> {
+    let mut len_index: HashMap<usize, Vec<&String>> = HashMap::new();
+    for word in dictionary {
+        len_index.entry(word.len()).or_default().push(word);
+    }
+    len_index
+}
+
 fn file_mode() {
     let total_start = Instant::now();
 
@@ -76,11 +86,7 @@ fn file_mode() {
 
     println!("Building length index...");
     let index_start = Instant::now();
-    let len_index: HashMap<usize, Vec<&String>> =
-        dictionary.iter().fold(HashMap::new(), |mut map, word| {
-            map.entry(word.len()).or_default().push(word);
-            map
-        });
+    let len_index = build_len_index(&dictionary);
     let index_time = index_start.elapsed();
 
     let options = vec!["edit_distance", "edit_distance_dyn"];
@@ -164,39 +170,94 @@ fn find_closest_words(
     let mut min_distance = usize::MAX;
     let mut closest_words = Vec::new();
     let max_dist = 3;
-    for len in word_len.saturating_sub(max_dist)..=word_len + max_dist {
-        if let Some(words) = len_index.get(&len) {
-            let results: Vec<_> = words
-                .par_iter()
-                .map(|dict_word| {
-                    let distance = match choice {
-                        "edit_distance" => edit_distance(word, dict_word),
-                        "edit_distance_dyn" => edit_distance_dyn(word, dict_word),
-                        _ => unreachable!(),
-                    };
-                    (dict_word, distance)
-                })
-                .collect();
+    let mut search_range = 1;
+
+    fn get_distance_results<'a>(
+        word: &'a str,
+        dict_words: &'a [&'a String],
+        choice: &'a str,
+    ) -> Vec<(&'a String, usize)> {
+        dict_words
+            .par_iter()
+            .filter_map(|dict_word| {
+                let dict_word = *dict_word;
+                if dict_word.len() < word.len().saturating_sub(1) {
+                    return None; // Skip words that are too short
+                }
+
+                let distance = match choice {
+                    "edit_distance" => edit_distance(word, dict_word),
+                    "edit_distance_dyn" => edit_distance_dyn(word, dict_word),
+                    _ => unreachable!(),
+                };
+
+                Some((dict_word, distance))
+            })
+            .collect()
+    }
+
+    loop {
+        let mut found_match_in_range = false;
+
+        for len in (word_len.saturating_sub(search_range))..=(word_len + search_range) {
+            if let Some(words) = len_index.get(&len) {
+                let results = get_distance_results(word, words, choice);
+
+                for (dict_word, distance) in results {
+                    match distance.cmp(&min_distance) {
+                        std::cmp::Ordering::Less => {
+                            min_distance = distance;
+                            closest_words = vec![dict_word.to_string()];
+                        }
+                        std::cmp::Ordering::Equal => {
+                            closest_words.push(dict_word.to_string());
+                        }
+                        _ => {}
+                    }
+                }
+
+                if !closest_words.is_empty() {
+                    found_match_in_range = true;
+                }
+            }
+        }
+
+        if found_match_in_range || search_range >= max_dist {
+            break;
+        }
+
+        search_range += 1;
+    }
+
+    if search_range == 2 {
+        if let Some(words) = len_index.get(&word_len) {
+            let results = get_distance_results(word, words, choice);
 
             for (dict_word, distance) in results {
-                match distance.cmp(&min_distance) {
-                    std::cmp::Ordering::Less => {
-                        min_distance = distance;
-                        closest_words = vec![dict_word.to_string()];
-                        if min_distance == 0 {
-                            return (closest_words, min_distance);
-                        }
-                    }
-                    std::cmp::Ordering::Equal => {
-                        closest_words.push(dict_word.to_string());
-                    }
-                    std::cmp::Ordering::Greater => (),
+                if distance < min_distance {
+                    min_distance = distance;
+                    closest_words = vec![dict_word.to_string()]; // Found a better match, reset.
+                } else if distance == min_distance {
+                    closest_words.push(dict_word.to_string()); // Same distance, add the word.
                 }
             }
         }
     }
 
     (closest_words, min_distance)
+}
+
+fn load_words(filename: &str) -> Result<Vec<String>, io::Error> {
+    let file = File::open(filename)?;
+
+    let mmap = unsafe { MmapOptions::new().map(&file)? };
+
+    let content =
+        str::from_utf8(&mmap).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+    let words: Vec<String> = content.split_whitespace().map(|s| s.to_string()).collect();
+
+    Ok(words)
 }
 
 fn print_stats(
@@ -232,10 +293,4 @@ fn print_stats(
         process_time / std::cmp::max(processed_words, 1) as u32
     );
     println!("\nTotal execution time: {:.2?}", total_time);
-}
-
-fn load_words(filename: &str) -> Result<Vec<String>, std::io::Error> {
-    let file = File::open(filename)?;
-    let reader = BufReader::new(file);
-    reader.lines().collect()
 }
