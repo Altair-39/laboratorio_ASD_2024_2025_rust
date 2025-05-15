@@ -16,13 +16,7 @@ pub fn compare<T: PartialOrd>(a: &T, b: &T) -> std::cmp::Ordering {
 
 #[inline]
 pub fn compare_f64_quicksort(a: f64, b: f64) -> Ordering {
-    if a < b {
-        Ordering::Less
-    } else if a > b {
-        Ordering::Greater
-    } else {
-        Ordering::Equal
-    }
+    a.partial_cmp(&b).unwrap_or(Ordering::Equal)
 }
 
 #[inline]
