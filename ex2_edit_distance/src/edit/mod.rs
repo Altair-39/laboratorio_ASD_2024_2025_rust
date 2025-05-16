@@ -36,9 +36,32 @@ pub fn edit_distance_dyn(s1: &str, s2: &str) -> usize {
     let len1 = bytes1.len();
     let len2 = bytes2.len();
 
-    let mut memo = vec![vec![None; len2 + 1]; len1 + 1];
+    let mut prefix_len = 0;
+    while prefix_len < len1 && prefix_len < len2 && bytes1[prefix_len] == bytes2[prefix_len] {
+        prefix_len += 1;
+    }
 
-    dp(bytes1, bytes2, 0, 0, &mut memo, usize::MAX)
+    let mut suffix_len = 0;
+    while suffix_len + prefix_len < len1
+        && suffix_len + prefix_len < len2
+        && bytes1[len1 - 1 - suffix_len] == bytes2[len2 - 1 - suffix_len]
+    {
+        suffix_len += 1;
+    }
+
+    let s1 = &bytes1[prefix_len..len1 - suffix_len];
+    let s2 = &bytes2[prefix_len..len2 - suffix_len];
+
+    let m = s1.len();
+    let n = s2.len();
+
+    let mut memo = vec![None; (m + 1) * (n + 1)];
+    dp(s1, s2, 0, 0, &mut memo, m.max(n), n)
+}
+
+#[inline(always)]
+fn idx(i: usize, j: usize, n: usize) -> usize {
+    i * (n + 1) + j
 }
 
 fn dp(
@@ -46,60 +69,60 @@ fn dp(
     s2: &[u8],
     i: usize,
     j: usize,
-    memo: &mut Vec<Vec<Option<usize>>>,
+    memo: &mut [Option<usize>],
     min_distance_found: usize,
+    n: usize,
 ) -> usize {
-    if let Some(cached) = memo[i][j] {
+    let k = idx(i, j, n);
+    if let Some(cached) = memo[k] {
         return cached;
     }
 
-    if (s1.len() - i).abs_diff(s2.len() - j) >= min_distance_found {
+    let len1 = s1.len();
+    let len2 = s2.len();
+
+    // Manual abs_diff
+    let remaining = if len1 - i > len2 - j {
+        len1 - i - (len2 - j)
+    } else {
+        len2 - j - (len1 - i)
+    };
+
+    if remaining >= min_distance_found {
         return min_distance_found;
     }
 
-    let result = if i == s1.len() {
-        s2.len() - j
-    } else if j == s2.len() {
-        s1.len() - i
+    let result = if i == len1 {
+        len2 - j
+    } else if j == len2 {
+        len1 - i
     } else if s1[i] == s2[j] {
-        dp(s1, s2, i + 1, j + 1, memo, min_distance_found)
+        return dp(s1, s2, i + 1, j + 1, memo, min_distance_found, n);
     } else {
-        let d_no_op = usize::MAX;
-
         let d_del = 1 + dp(
             s1,
             s2,
             i + 1,
             j,
             memo,
-            min_distance_found.min(d_no_op).saturating_sub(1),
+            min_distance_found.saturating_sub(1),
+            n,
         );
         if d_del >= min_distance_found {
-            memo[i][j] = Some(min_distance_found);
+            memo[k] = Some(min_distance_found);
             return min_distance_found;
         }
 
-        let d_ins = 1 + dp(
-            s1,
-            s2,
-            i,
-            j + 1,
-            memo,
-            min_distance_found.min(d_del).saturating_sub(1),
-        );
+        let d_ins = 1 + dp(s1, s2, i, j + 1, memo, d_del.saturating_sub(1), n);
+        if d_ins >= d_del {
+            memo[k] = Some(d_del);
+            return d_del;
+        }
 
-        let d_sub = 1 + dp(
-            s1,
-            s2,
-            i + 1,
-            j + 1,
-            memo,
-            min_distance_found.min(d_ins).saturating_sub(1),
-        );
-
+        let d_sub = 1 + dp(s1, s2, i + 1, j + 1, memo, d_ins.saturating_sub(1), n);
         d_del.min(d_ins).min(d_sub)
     };
 
-    memo[i][j] = Some(result);
-    result.min(min_distance_found)
+    memo[k] = Some(result);
+    result
 }
